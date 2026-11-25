@@ -11,6 +11,31 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - **Content ID:** IV0000-RGBB00001_00-RGBBARCONTROL000
 - **Build:** open the folder in VS Code and press Ctrl+Shift+B, or run `make` in a terminal with `OO_PS4_TOOLCHAIN` set and `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
 
+## Release notes — v2.00 (v2)
+
+**RGB-Controller v2** — on-screen menu + R/G/B sliders + disco speed control.
+- On-screen menu, navigable with Pad 1: D-pad Up/Down moves between rows,
+  D-pad Left/Right adjusts (hold to repeat), X confirms/advances a row,
+  Triangle toggles Disco <-> Custom, Circle jumps back to Disco.
+- Menu rows: Mode (PRESETS / DISCO / CUSTOM), Pad (1-4 or All), Red,
+  Green, Blue (0-255 sliders per pad, with on-screen slider bars),
+  Preset (blue/red/green/magenta/yellow/cyan/white/orange), Disco speed.
+- R/G/B sliders are per pad — set each pad its own colour, or set Pad to
+  All and adjust every pad at once. Editing a slider or applying a preset
+  switches to CUSTOM mode so the colour stays.
+- Disco speed 1-5 (Slow / Slow+ / Normal / Fast / Very fast). Speed 3 is
+  Normal, about the same pace as v1.1; speed 1 is the slowest, speed 5
+  cycles the rainbow in about 3-4 seconds.
+- Kept from v1.1: presets on startup, disco mode, on-screen display with
+  return codes, /data/rgb_log.txt logging, rumble pulse at startup, and
+  the 512x512 rainbow icon.
+- PKG built 2026-11-25, version 2.00, same filename
+  IV0000-RGBB00001_00-RGBBARCONTROL000.pkg, 6.4 MB. USB was not plugged
+  in, so the PKG was left ready in ~/RGBBarControl/ to copy to
+  /media/matt/PS4DATA/pkg/ when Matty wakes. **Untested on real PS4 yet**
+  — Matty was napping when v2 was built, so the menu/input needs a real
+  PS4 test (see test notes below).
+
 ## Release notes — v1.10 (v1.1)
 
 **RGB-Controller v1.1** — light-bar fix + on-screen display + new icon.
@@ -55,6 +80,15 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
   still do not change, the on-screen return codes and
   `/data/rgb_log.txt` say exactly which call failed.
 
+### v2.0 test — needs Matty on real PS4 (not tested yet, built while he napped)
+- Install the v2 PKG from /media/matt/PS4DATA/pkg/ (copy it there first — USB was unplugged).
+- Check the menu shows: Mode / Pad / Red / Green / Blue / Preset / Disco speed.
+- D-pad Up/Down moves the > cursor; Left/Right changes the value; hold Left/Right to repeat.
+- Set Pad to 1, move Red to 255, Green/Blue to 0 — Pad 1 light bar should go red and stay (CUSTOM mode).
+- Try a preset, try Disco speed 1 vs 5 — rainbow should be clearly slower/faster.
+- Triangle should toggle Disco <-> Custom; Circle should jump back to Disco.
+- If a button does nothing, check /data/rgb_log.txt — menu changes are logged there.
+
 ## How it works
 
 - Gets the real login user with `sceUserServiceGetInitialUser`, opens
@@ -75,10 +109,9 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - **v1.0:** preset colours + Disco Mode (rainbow hue cycle). No menu
   yet — just run the app and the light bars cycle. Tested 2026-11-25:
   black screen, light bars did not change (see test log above).
-- **v1.1 (this build):** light-bar fix, on-screen display, new icon.
-- **v2 (later):** on-screen menu with R/G/B sliders per pad, presets,
-  rainbow cycle speed control. Needs a new icon instead of the
-  placeholder — done in v1.1.
+- **v1.1:** light-bar fix, on-screen display, new icon. Tested 2026-11-25: works.
+- **v2 (this build):** on-screen menu with R/G/B sliders per pad, presets,
+  disco speed control. Untested on real PS4 yet — Matty was napping.
 - **v3 (later):** background mode — a GoldHEN plugin (.prx), not a
   normal app, so colours keep working in games. Harder/riskier.
 - **v4 (planned, future only):** music / audio out of the controller

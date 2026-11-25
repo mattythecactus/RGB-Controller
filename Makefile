@@ -1,6 +1,6 @@
 # Package metadata.
 TITLE       := RGB-Controller
-VERSION     := 2.00
+VERSION     := 1.02
 TITLE_ID    := RGBB00001
 CONTENT_ID  := IV0000-RGBB00001_00-RGBBARCONTROL000
 

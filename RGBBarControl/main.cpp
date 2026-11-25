@@ -1,26 +1,43 @@
-// RGB-Controller v2.00 — PS4 homebrew (OpenOrbis)
+// RGB-Controller v1.03 — PS4 homebrew (OpenOrbis)
 //
-// v2 adds an on-screen menu, navigable with the controller:
-//   D-pad Up/Down  move between menu rows
-//   D-pad Left/Right  adjust the selected row (hold to repeat)
-//   X (Cross)  confirm / advance the selected row
-//   Triangle  toggle Disco <-> Custom
-//   Circle  jump back to Disco mode
-// Menu rows: Mode, Pad, Red, Green, Blue, Preset, Disco Speed.
+// v1.03 adds music out of the DualShock 4 controller speaker (roadmap v3):
+//   Default track (LOOPED): "Sony's Playstation 4 Start-up Tune (TXZ1'S EPIC
+//   REMIX) and also _ eljon9's Theme Song" — bundled as
+//   assets/audio/ps4_startup.mp3, pre-decoded at BUILD time with ffmpeg to
+//   raw 48kHz mono 16-bit PCM (assets/audio/ps4_startup.pcm), which is what
+//   the app actually plays. There is no usable in-app MP3 decoder in this
+//   toolchain: libSceAudiodec exists (ORBIS_AUDIO_DEC_CODEC_MP3 = 0x0002)
+//   but its control structs are undocumented "unk" fields in the OpenOrbis
+//   headers, so decoding MP3 on the console was not attempted.
+//   New menu row "Audio": Pad speaker / TV / Both / Off. Default: Pad speaker.
+//   Audio is fed in 256-sample grains via sceAudioOutOutput (MAIN port for
+//   TV, PADSPK port for the pad speaker); Both uses sceAudioOutOutputs.
+//   HONEST LIMITS (see README): the PADSPK port value (3) is NOT defined in
+//   the OpenOrbis headers — only MAIN is. It comes from the official PS4 SDK
+//   port order (MAIN=0, BGM=1, VOICE=2, PADSPK=3) and is UNVERIFIED on real
+//   hardware. If the pad-speaker open fails, the return code is logged and
+//   shown on screen and the app keeps running; TV is the proven fallback
+//   (same sceAudioOutOpen pattern as the toolchain's audio-wav sample).
+//   "Both" relies on sceAudioOutOutputs, also untested on real hardware:
+//   if it fails, the app falls back to Pad speaker only and logs it.
+// Menu rows (8): Mode, Pad, Red, Green, Blue, Preset, Disco Speed, Audio.
 // R/G/B sliders are per pad (0-255 each); Pad can be 1-4 or All.
 // Presets apply to the selected pad (or All) and switch to Custom mode.
 // Disco speed 1-5 controls the hue-cycle speed.
 // v1.1 behaviour kept: scePadInit/scePadOpen with return codes logged,
 // real login user, scePadReadState polled every tick, return codes on
 // screen + /data/rgb_log.txt, rumble pulse at startup, Scene2D display.
-// LIMIT: colour only lasts while this app is open and in the foreground.
+// LIMIT: colour AND music only last while this app is open and in the
+// foreground. Quitting the app stops both.
 
 #include <orbis/libkernel.h>
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
 #include <orbis/VideoOut.h>
+#include <orbis/AudioOut.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #include "graphics.h"
 #include "log.h"
@@ -45,6 +62,7 @@ static const char *kPresetNames[8] = {"blue", "red", "green", "magenta",
                                       "yellow", "cyan", "white", "orange"};
 static const char *kModeNames[3] = {"PRESETS", "DISCO", "CUSTOM"};
 static const char *kSpeedNames[6] = {"", "Slow", "Slow+", "Normal", "Fast", "Very fast"};
+static const char *kAudioNames[4] = {"Pad speaker", "TV", "Both", "Off"};
 
 static OrbisPadColor HueToRgb(int hue)
 {
@@ -79,11 +97,199 @@ static void LogLine(const char *line)
     }
 }
 
+// ---- Audio (v1.03) ----
+// Controller-speaker port: NOT defined in the OpenOrbis headers (only
+// ORBIS_AUDIO_OUT_PORT_TYPE_MAIN = 0 is). Value 3 is the pad-speaker port
+// in the official PS4 SDK (MAIN=0, BGM=1, VOICE=2, PADSPK=3). UNVERIFIED
+// on real hardware — if sceAudioOutOpen rejects it, the return code is
+// logged + shown on screen and the app carries on without pad audio.
+#define ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK ((OrbisAudioOutPort)3)
+
+static int audioMode = 0; // 0 Pad speaker, 1 TV, 2 Both, 3 Off. Default: Pad.
+static int32_t g_audioPad = -1;  // PADSPK handle, or -1 if not open
+static int32_t g_audioTv = -1;   // MAIN (TV) handle, or -1 if not open
+static int16_t *g_pcm = nullptr; // decoded track: 48kHz mono s16 samples
+static size_t g_pcmSamples = 0;  // total mono samples in g_pcm
+static size_t g_playPos = 0;     // next sample to play (wraps = loop)
+static bool g_audioFailed = false; // a feed call errored; stop feeding
+static int32_t g_audioInitRc = -999;
+static int32_t g_audioPadRc = -999;
+static int32_t g_audioTvRc = -999;
+static char g_audioStatus[160] = "not started";
+
+static void AudioCloseAll()
+{
+    if (g_audioPad >= 0)
+    {
+        sceAudioOutClose(g_audioPad);
+        g_audioPad = -1;
+    }
+    if (g_audioTv >= 0)
+    {
+        sceAudioOutClose(g_audioTv);
+        g_audioTv = -1;
+    }
+}
+
+// (Re)open the audio ports for the current audioMode. Called at startup
+// and whenever the Audio menu row changes. Never hangs the app: a failed
+// open just leaves that handle at -1 and records the return code.
+static void AudioApplyMode(int32_t userId)
+{
+    AudioCloseAll();
+    g_audioPadRc = -999;
+    g_audioTvRc = -999;
+    if (g_audioInitRc != 0)
+    {
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "audio lib init FAILED rc=%d", (int)g_audioInitRc);
+        LogLine("Audio: not opening ports, sceAudioOutInit failed");
+        return;
+    }
+    if (g_audioFailed)
+    {
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "FAILED earlier, not reopening");
+        LogLine("Audio: not reopening (earlier feed failure)");
+        return;
+    }
+    if (!g_pcm || g_pcmSamples == 0)
+    {
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "No PCM loaded");
+        return;
+    }
+    if (audioMode == 3) // Off
+    {
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Off");
+        LogLine("Audio: Off");
+        return;
+    }
+    char buf[200];
+    if (audioMode == 0 || audioMode == 2)
+    {
+        // Pad speaker: mono 48kHz s16, same grain size (256) as the
+        // toolchain audio-wav sample. UserId = the pad's login user.
+        g_audioPad = sceAudioOutOpen(userId, ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK, 0, 256, 48000,
+                                     ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
+        g_audioPadRc = g_audioPad;
+        if (g_audioPad <= 0)
+            g_audioPad = -1;
+        snprintf(buf, sizeof(buf), "sceAudioOutOpen PADSPK handle/rc=%d", (int)g_audioPadRc);
+        LogLine(buf);
+    }
+    if (audioMode == 1 || audioMode == 2)
+    {
+        // TV: stereo 48kHz s16 on MAIN — the exact pattern from the
+        // toolchain audio-wav sample (SYSTEM user, MAIN port).
+        g_audioTv = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                    ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        g_audioTvRc = g_audioTv;
+        if (g_audioTv <= 0)
+            g_audioTv = -1;
+        snprintf(buf, sizeof(buf), "sceAudioOutOpen MAIN handle/rc=%d", (int)g_audioTvRc);
+        LogLine(buf);
+    }
+    if (audioMode == 0)
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Pad spk %s", (g_audioPad >= 0) ? "OK" : "OPEN FAILED");
+    else if (audioMode == 1)
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "TV %s", (g_audioTv >= 0) ? "OK" : "OPEN FAILED");
+    else
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Both: pad %s / TV %s",
+                 (g_audioPad >= 0) ? "OK" : "FAILED", (g_audioTv >= 0) ? "OK" : "FAILED");
+    snprintf(buf, sizeof(buf), "Audio mode -> %s (%s)", kAudioNames[audioMode], g_audioStatus);
+    LogLine(buf);
+}
+
+// Feed ~101 ms of audio (19 grains x 256 samples @ 48kHz) to every open
+// port, looping the track when the end is reached. Mirrors the toolchain
+// audio-wav sample: sceAudioOutOutput(handle, NULL) waits for the previous
+// grain, then Output(handle, grain) queues the next one. Output blocks
+// until the grain is consumed, so this paces the main loop at ~real time
+// while music is playing (the fixed 100 ms sleep is skipped on fed ticks).
+// Returns true if any audio was fed this tick.
+// On a feed error: logs it, closes the ports, stops feeding for good
+// (music off, menu + light bars keep working).
+static bool AudioFeedTick()
+{
+    if (!g_pcm || g_pcmSamples == 0 || g_audioFailed)
+        return false;
+    if (g_audioPad < 0 && g_audioTv < 0)
+        return false;
+    int16_t monoGrain[256];
+    int16_t stereoGrain[256 * 2];
+    for (int g = 0; g < 19; g++) // 19 x 256 = 4864 samples ~ 101 ms
+    {
+        for (int i = 0; i < 256; i++)
+        {
+            monoGrain[i] = g_pcm[g_playPos];
+            g_playPos++;
+            if (g_playPos >= g_pcmSamples)
+                g_playPos = 0; // loop
+        }
+        int32_t rc = 0;
+        if (g_audioPad >= 0 && g_audioTv >= 0)
+        {
+            // Both: one sceAudioOutOutputs call feeds both ports the same
+            // grain at the same time (mono to the pad, mono duplicated to
+            // stereo for the TV). No NULL-wait here: Outputs' NULL-pointer
+            // behaviour is undocumented, so only the data call is used.
+            for (int i = 0; i < 256; i++)
+            {
+                stereoGrain[i * 2] = monoGrain[i];
+                stereoGrain[i * 2 + 1] = monoGrain[i];
+            }
+            OrbisAudioOutOutputParam params[2];
+            params[0].handle = g_audioPad;
+            params[0].pointer = monoGrain;
+            params[1].handle = g_audioTv;
+            params[1].pointer = stereoGrain;
+            rc = sceAudioOutOutputs(params, 2);
+            if (rc < 0)
+            {
+                // "Both" via sceAudioOutOutputs failed — fall back to Pad
+                // speaker only for the rest of this session, don't die.
+                LogLine("WARN: sceAudioOutOutputs (Both) failed, falling back to Pad only");
+                sceAudioOutClose(g_audioTv);
+                g_audioTv = -1;
+                audioMode = 0;
+                snprintf(g_audioStatus, sizeof(g_audioStatus), "Both FAILED -> Pad spk %s",
+                         (g_audioPad >= 0) ? "OK" : "OPEN FAILED");
+                rc = sceAudioOutOutput(g_audioPad, monoGrain);
+            }
+        }
+        else if (g_audioPad >= 0)
+        {
+            sceAudioOutOutput(g_audioPad, NULL); // wait for previous grain
+            rc = sceAudioOutOutput(g_audioPad, monoGrain);
+        }
+        else
+        {
+            for (int i = 0; i < 256; i++)
+            {
+                stereoGrain[i * 2] = monoGrain[i];
+                stereoGrain[i * 2 + 1] = monoGrain[i];
+            }
+            sceAudioOutOutput(g_audioTv, NULL); // wait for previous grain
+            rc = sceAudioOutOutput(g_audioTv, stereoGrain);
+        }
+        if (rc < 0)
+        {
+            char buf[192];
+            snprintf(buf, sizeof(buf), "Audio feed FAILED rc=%d (pad=%d tv=%d) — music stopped, menu still works",
+                     (int)rc, (int)g_audioPad, (int)g_audioTv);
+            LogLine(buf);
+            snprintf(g_audioStatus, sizeof(g_audioStatus), "FEED FAILED rc=%d", (int)rc);
+            g_audioFailed = true;
+            AudioCloseAll();
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     g_log = fopen("/data/rgb_log.txt", "w");
-    LogLine("RGB-Controller v2.00 starting...");
+    LogLine("RGB-Controller v1.03 starting...");
 
     // ---- On-screen display (best effort: pads still work without it)
     Scene2D *scene = nullptr;
@@ -177,14 +383,69 @@ int main(void)
         LogLine(buf);
     }
 
-    // ---- v2 state
+    // ---- Audio (v1.03): init lib, load decoded PCM, open ports for the
+    // default mode (Pad speaker). Music is best-effort: any failure here
+    // only disables music, never the light bars or the menu.
+    g_audioInitRc = sceAudioOutInit();
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "sceAudioOutInit rc=%d", (int)g_audioInitRc);
+        LogLine(buf);
+    }
+    if (g_audioInitRc == 0)
+    {
+        FILE *af = fopen("/app0/assets/audio/ps4_startup.pcm", "rb");
+        if (af)
+        {
+            fseek(af, 0, SEEK_END);
+            long sz = ftell(af);
+            fseek(af, 0, SEEK_SET);
+            if (sz > 0 && (sz % 2) == 0)
+            {
+                g_pcm = (int16_t *)malloc((size_t)sz);
+                if (g_pcm && fread(g_pcm, 1, (size_t)sz, af) == (size_t)sz)
+                {
+                    g_pcmSamples = (size_t)sz / 2;
+                    char buf[192];
+                    snprintf(buf, sizeof(buf), "PCM loaded: %zu samples = %zu:%02zu @ 48kHz mono (%ld bytes)",
+                             g_pcmSamples, g_pcmSamples / 48000 / 60, (g_pcmSamples / 48000) % 60, sz);
+                    LogLine(buf);
+                }
+                else
+                {
+                    LogLine("WARN: PCM malloc/read failed — music disabled");
+                    if (g_pcm)
+                    {
+                        free(g_pcm);
+                        g_pcm = nullptr;
+                    }
+                }
+            }
+            else
+            {
+                LogLine("WARN: PCM asset has odd/empty size — music disabled");
+            }
+            fclose(af);
+        }
+        else
+        {
+            LogLine("WARN: /app0/assets/audio/ps4_startup.pcm missing — music disabled");
+        }
+    }
+    else
+    {
+        LogLine("WARN: sceAudioOutInit failed — music disabled");
+    }
+    AudioApplyMode(initialUser);
+
+    // ---- v1.02 state (kept)
     // mode: 0 PRESETS, 1 DISCO, 2 CUSTOM. Start on PRESETS (v1 look).
     int mode = 0;
     int hue = 0;
     int discoSpeed = 3;                 // 1..5, 3 = Normal
     int selectedPad = 0;                // 0..3 = Pad 1..4, 4 = All
     int presetIdx = 0;
-    int menuRow = 0;                    // 0..6
+    int menuRow = 0;                    // 0..7 (v1.03: Audio is row 7)
     OrbisPadColor custom[4];
     for (int i = 0; i < 4; i++)
         custom[i] = kPresets[i % 4];
@@ -238,6 +499,10 @@ int main(void)
             if (discoSpeed < 1) discoSpeed = 1;
             if (discoSpeed > 5) discoSpeed = 5;
             break;
+        case 7: // Audio output: Pad speaker / TV / Both / Off
+            audioMode = (audioMode + dir + 4) % 4;
+            AudioApplyMode(initialUser);
+            break;
         }
     };
 
@@ -254,6 +519,8 @@ int main(void)
             discoSpeed++;
             if (discoSpeed > 5) discoSpeed = 1;
         }
+        else if (menuRow == 7)
+            adjustRow(1);
         // R/G/B rows: X does nothing (use Left/Right).
     };
 
@@ -271,11 +538,11 @@ int main(void)
         Color bg = {(uint8_t)(colours[0].r / 10), (uint8_t)(colours[0].g / 10),
                     (uint8_t)(colours[0].b / 10)};
         scene->FrameBufferFill(bg);
-        // 4 colour bars, one per pad.
+        // 4 colour bars, one per pad (moved down in v1.03: menu has 8 rows now).
         for (int i = 0; i < 4; i++)
         {
             Color bar = {colours[i].r, colours[i].g, colours[i].b};
-            scene->DrawRectangle(120 + i * 440, 900, 400, 80, bar);
+            scene->DrawRectangle(120 + i * 440, 925, 400, 55, bar);
         }
         if (haveFont)
         {
@@ -284,19 +551,19 @@ int main(void)
             Color grey = {180, 180, 180};
             char line[256];
             scene->DrawText((char *)"RGB-CONTROLLER", fontLarge, 120, 180, black, white);
-            scene->DrawText((char *)"v2.00 - Menu + RGB Sliders + Disco Speed", fontSmall, 120, 280, black, white);
+            scene->DrawText((char *)"v1.03 - Menu + RGB Sliders + Disco Speed + Music", fontSmall, 120, 280, black, white);
             snprintf(line, sizeof(line), "MODE: %s   hue %d   Disco speed: %s (%d/5)",
                      kModeNames[mode], hue, kSpeedNames[discoSpeed], discoSpeed);
             scene->DrawText(line, fontSmall, 120, 350, black, white);
-            snprintf(line, sizeof(line), "Pads open: %d / 4    Init rc=%d    User=%d",
-                     opened, (int)initRc, (int)initialUser);
+            snprintf(line, sizeof(line), "Pads open: %d / 4    Init rc=%d    User=%d    Audio: %s",
+                     opened, (int)initRc, (int)initialUser, g_audioStatus);
             scene->DrawText(line, fontSmall, 120, 410, black, white);
 
-            // Menu rows, y = 470 + row*62.
-            const char *labels[7] = {"Mode", "Pad", "Red", "Green", "Blue", "Preset", "Disco speed"};
-            for (int r = 0; r < 7; r++)
+            // Menu rows, y = 470 + row*56 (v1.03: 8 rows, tighter spacing).
+            const char *labels[8] = {"Mode", "Pad", "Red", "Green", "Blue", "Preset", "Disco speed", "Audio"};
+            for (int r = 0; r < 8; r++)
             {
-                int y = 470 + r * 62;
+                int y = 470 + r * 56;
                 const char *cursor = (r == menuRow) ? ">" : " ";
                 char val[96] = "";
                 Color fg = (r == menuRow) ? white : grey;
@@ -317,6 +584,7 @@ int main(void)
                 }
                 case 5: snprintf(val, sizeof(val), "%s", kPresetNames[presetIdx]); break;
                 case 6: snprintf(val, sizeof(val), "%s (%d/5)", kSpeedNames[discoSpeed], discoSpeed); break;
+                case 7: snprintf(val, sizeof(val), "%s", kAudioNames[audioMode]); break;
                 }
                 snprintf(line, sizeof(line), "%s %s: %s", cursor, labels[r], val);
                 scene->DrawText(line, fontSmall, 120, y, black, fg);
@@ -344,7 +612,7 @@ int main(void)
         frameID++;
     };
 
-    LogLine("v2 menu running — D-pad to move, Left/Right to adjust, X to confirm");
+    LogLine("v1.03 menu running — D-pad to move, Left/Right to adjust, X to confirm");
     for (;;)
     {
         // ---- Input (Pad 1 only), edge + hold-repeat for Left/Right.
@@ -357,12 +625,12 @@ int main(void)
         uint32_t pressed = buttons & ~prevButtons;
         if (pressed & ORBIS_PAD_BUTTON_UP)
         {
-            menuRow = (menuRow + 6) % 7;
+            menuRow = (menuRow + 7) % 8;
             heldButton = 0; heldTicks = 0;
         }
         if (pressed & ORBIS_PAD_BUTTON_DOWN)
         {
-            menuRow = (menuRow + 1) % 7;
+            menuRow = (menuRow + 1) % 8;
             heldButton = 0; heldTicks = 0;
         }
         if (pressed & ORBIS_PAD_BUTTON_CROSS)
@@ -409,10 +677,14 @@ int main(void)
             else
                 colours[i] = kPresets[i % 4];
         }
+
+        // ---- Music: feed ~101 ms of PCM (blocks ~real time while playing).
+        bool fedAudio = AudioFeedTick();
         tick(colours);
         if (mode == 1)
             hue = (hue + discoSpeed * 2) % 360; // 100ms tick: speed 3 = 6deg/tick
-        sceKernelUsleep(100000);
+        if (!fedAudio)
+            sceKernelUsleep(100000);
     }
 
     return 0;

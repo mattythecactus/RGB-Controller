@@ -11,6 +11,58 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - **Content ID:** IV0000-RGBB00001_00-RGBBARCONTROL000
 - **Build:** open the folder in VS Code and press Ctrl+Shift+B, or run `make` in a terminal with `OO_PS4_TOOLCHAIN` set and `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
 
+## Release notes — 1.03
+
+**RGB-Controller 1.03** — music out of the DualShock 4 controller speaker.
+- Default track, LOOPED continuously: "Sony's Playstation 4 Start-up Tune
+  (TXZ1'S EPIC REMIX) and also _ eljon9's Theme Song" — the file Matty
+  downloaded, `Sony's Playstation 4 Start-up Tune (TXZ1'S EPIC REMIX) and
+  also _ eljon9's Theme Song (1).mp3` (4,619,325 bytes, 4:19, in
+  ~/Downloads/, left exactly as downloaded — NOT renamed). The identical
+  file without " (1)" has the same md5, so either copy is the same track.
+- The track is bundled two ways in the PKG:
+  - `assets/audio/ps4_startup.mp3` — the original MP3, kept for reference
+    and for 1.04 (custom music).
+  - `assets/audio/ps4_startup.pcm` — the track decoded at BUILD time on
+    the laptop with ffmpeg to raw 48 kHz mono 16-bit PCM (24,911,482
+    bytes, 12,455,741 samples, 4:19). This is what the app actually
+    plays. There is no usable in-app MP3 decoder in this toolchain
+    (libSceAudiodec has an MP3 codec id, but its control structs are
+    undocumented "unk" fields), so the MP3 is decoded before the build
+    instead of on the console.
+- New menu row "Audio" (row 8, D-pad Up/Down to reach it, Left/Right or X
+  to change it): **Pad speaker** (default) / **TV** / **Both** / **Off**.
+  - Pad speaker: music out of the DualShock 4's built-in mono speaker
+    (tinny, as expected) via `sceAudioOutOpen` on the pad-speaker port.
+  - TV: music out of the TV over HDMI via the MAIN audio port — the same
+    proven pattern as the toolchain's audio-wav sample.
+  - Both: the same track fed to the pad speaker AND the TV at the same
+    time via `sceAudioOutOutputs`.
+  - Off: no music. The track keeps looping from where it was when you
+    switch back (play position is kept across mode changes).
+- Kept from 1.02: on-screen menu (now 8 rows), R/G/B sliders, presets,
+  disco speed, return codes, /data/rgb_log.txt logging, rumble pulse,
+  icon. Menu rows are slightly tighter (56 px spacing) and the 4 colour
+  bars moved down to make room for the 8th row.
+- PKG built 2026-11-25, version 1.03, same filename
+  IV0000-RGBB00001_00-RGBBARCONTROL000.pkg, ~33.5 MB (the PCM audio is
+  ~25 MB of that). **Untested on real PS4 yet** — see test notes below.
+
+### Honest limits — read before testing (1.03 audio)
+- The pad-speaker port is NOT defined in the OpenOrbis headers (only the
+  MAIN/TV port is). 1.03 opens it as port value 3, from the official PS4
+  SDK port order (MAIN=0, BGM=1, VOICE=2, PADSPK=3). That value is
+  UNVERIFIED on real hardware: if the PS4 rejects it, the on-screen
+  "Audio:" line will say "Pad spk OPEN FAILED" and /data/rgb_log.txt
+  will show the `sceAudioOutOpen PADSPK` return code, and the app keeps
+  running (light bars unaffected). Switch Audio to TV in that case.
+- "Both" relies on `sceAudioOutOutputs`, also untested on real hardware.
+  If it fails, the app falls back to Pad speaker only and logs it.
+- If a feed call fails mid-song, music stops for good (that run) and the
+  log says why; menu + light bars keep working. Restart the app to retry.
+- Music (like the colours) only plays while this app is open in the
+  foreground. Quitting stops it.
+
 ## Release notes — 1.02
 
 **RGB-Controller 1.02** — on-screen menu + R/G/B sliders + disco speed control.
@@ -32,9 +84,8 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - PKG built 2026-11-25, version 1.02, same filename
   IV0000-RGBB00001_00-RGBBARCONTROL000.pkg, 6.4 MB. USB was not plugged
   in, so the PKG was left ready in ~/RGBBarControl/ to copy to
-  /media/matt/PS4DATA/pkg/ when Matty wakes. **Untested on real PS4 yet**
-  — Matty was napping when 1.02 was built, so the menu/input needs a real
-  PS4 test (see test notes below).
+  /media/matt/PS4DATA/pkg/ when Matty wakes. **TESTED 2026-11-25 on Baikal
+  PS4 Slim: disco speed and sliders work** (see test notes below).
 
 ## Release notes — 1.01
 
@@ -90,6 +141,24 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - Triangle should toggle Disco <-> Custom; Circle should jump back to Disco.
 - If a button does nothing, check /data/rgb_log.txt — menu changes are logged there.
 
+### 1.03 test — needs Matty on real PS4 (not tested yet)
+- Install the 1.03 PKG from /media/matt/PS4DATA/pkg/ (copy it there first
+  if the USB wasn't plugged in — the PKG is ~33.5 MB now).
+- On launch (default Audio: Pad speaker) the PS4 startup tune should
+  start playing out of the controller speaker within a second or two,
+  tinny mono, and LOOP when it ends (4:19 per loop).
+- Check the on-screen "Audio:" line: it should say "Pad spk OK". If it
+  says "Pad spk OPEN FAILED", note the `sceAudioOutOpen PADSPK` return
+  code in /data/rgb_log.txt — that tells us the port value is wrong.
+- Move to the Audio row (bottom row) and try TV: the tune should come
+  out of the TV instead. Try Both: tune from pad AND TV at once. Try
+  Off: silence. Switching back resumes the tune from where it was.
+- If you hear nothing anywhere, check /data/rgb_log.txt for the
+  `sceAudioOutInit`, `PCM loaded`, and `sceAudioOutOpen` lines — they
+  say exactly which step failed.
+- Also re-check the 1.02 menu still works (all 8 rows now) — the Audio
+  row is the only new one.
+
 ## How it works
 
 - Gets the real login user with `sceUserServiceGetInitialUser`, opens
@@ -105,17 +174,23 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
   toolchain `_common` folder; font `Gontserrat-Regular.ttf` in
   `assets/fonts/`).
 
+- Music (1.03): the default track is decoded at build time to raw PCM
+  (`assets/audio/ps4_startup.pcm`, 48 kHz mono s16) and fed to the audio
+  ports in 256-sample grains with `sceAudioOutOutput` / `sceAudioOutOutputs`,
+  looping at the end of the track. Pad speaker = PADSPK port (value 3,
+  unverified — see limits above), TV = MAIN port, Both = both at once.
+
 ## Versions
 
 - **1.00:** preset colours + Disco Mode (rainbow hue cycle). No menu
   yet — just run the app and the light bars cycle. Tested 2026-11-25:
   black screen, light bars did not change (see test log above).
 - **1.01:** light-bar fix, on-screen display, new icon. Tested 2026-11-25: works.
-- **1.02 (this build):** on-screen menu with R/G/B sliders per pad, presets,
-  disco speed control. Untested on real PS4 yet — Matty was napping.
-- **1.03 (next, planned):** music / audio out of the controller
-  — play sound through the DualShock 4's built-in speaker
-  (tinny mono).
+- **1.02:** on-screen menu with R/G/B sliders per pad, presets,
+  disco speed control. Tested 2026-11-25: works — disco speed and sliders tested on Baikal Slim.
+- **1.03 (this build):** music / audio out of the DualShock 4
+  controller speaker — default track looped, Audio menu row (Pad
+  speaker / TV / Both / Off). Untested on real PS4 yet.
 - **1.04 (planned, future only):** custom music selectable — let the user
   pick their own music/audio file to play through the controller
   speaker (from 1.03), e.g. choose a track in the menu.

@@ -1,11 +1,11 @@
 # Package metadata.
 TITLE       := RGB-Controller
-VERSION     := 1.02
+VERSION     := 1.03
 TITLE_ID    := RGBB00001
 CONTENT_ID  := IV0000-RGBB00001_00-RGBBARCONTROL000
 
 # Libraries linked into the ELF.
-LIBS        := -lc -lkernel -lc++ -lScePad -lSceUserService -lSceVideoOut -lSceSysmodule -lSceFreeType
+LIBS        := -lc -lkernel -lc++ -lScePad -lSceUserService -lSceVideoOut -lSceSysmodule -lSceFreeType -lSceAudioOut
 
 # Additional compile flags.
 EXTRAFLAGS  := -DGRAPHICS_USES_FONT

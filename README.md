@@ -112,13 +112,18 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - **v1.1:** light-bar fix, on-screen display, new icon. Tested 2026-11-25: works.
 - **v2 (this build):** on-screen menu with R/G/B sliders per pad, presets,
   disco speed control. Untested on real PS4 yet — Matty was napping.
-- **v3 (later):** background mode — a GoldHEN plugin (.prx), not a
-  normal app, so colours keep working in games. Harder/riskier.
-- **v4 (planned, future only):** music / audio out of the controller
-  — play sound through the DualShock 4's built-in speaker.
-- **v5 (planned, future only):** custom music selectable — let the user
+- **v3 (next, planned):** music / audio out of the controller
+  — play sound through the DualShock 4's built-in speaker
+  (tinny mono).
+- **v4 (planned, future only):** custom music selectable — let the user
   pick their own music/audio file to play through the controller
-  speaker (from v4), e.g. choose a track in the menu.
+  speaker (from v3), e.g. choose a track in the menu.
+- **v5 (planned, last):** background mode — a GoldHEN plugin (.prx),
+  not a normal app, so colours keep working in games.
+  Harder/riskier.
+
+> Roadmap reordered 2026-11-25: music first (v3 speaker music, v4
+> custom music), background GoldHEN plugin last (v5).
 
 ## Limits — read this
 

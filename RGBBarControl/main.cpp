@@ -1,4 +1,4 @@
-// RGB Bar Control v1 — PS4 homebrew (OpenOrbis)
+// RGB-Controller v1 — PS4 homebrew (OpenOrbis)
 // Sets each connected DualShock 4 light bar to a preset colour, then
 // runs DISCO MODE: a rainbow hue cycle, with each pad offset so the
 // pads are never all the same colour at once.
@@ -49,7 +49,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("RGB Bar Control v1 starting...\n");
+    printf("RGB-Controller v1 starting...\n");
 
     if (scePadInit() != 0)
     {

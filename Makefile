@@ -1,8 +1,8 @@
 # Package metadata.
-TITLE       := RGB Bar Control
+TITLE       := RGB-Controller
 VERSION     := 1.00
 TITLE_ID    := RGBB00001
-CONTENT_ID  := IV0000-RGBB00001_00-RGBBARCONTROL00
+CONTENT_ID  := IV0000-RGBB00001_00-RGBBARCONTROL000
 
 # Libraries linked into the ELF.
 LIBS        := -lc -lkernel -lc++ -lScePad -lSceUserService

@@ -1,10 +1,22 @@
-# RGB Bar Control
+# RGB-Controller
+
+## Release notes — v1.00 (GitHub)
+
+**RGB-Controller v1** — per-controller light bar colours + disco mode.
+- Preset colours: Pad 1 blue, Pad 2 red, Pad 3 green, Pad 4 magenta (held 3 seconds).
+- Disco mode: rainbow hue cycle, colour changes every 0.5s, each pad offset by 90 degrees.
+- Colours re-apply while the app is open and in the foreground.
+
+Planned: v2 menu + R/G/B sliders, v3 background GoldHEN plugin, v4 music out of the DualShock 4 speaker, v5 custom music selectable.
+
+Limits: colour only lasts while the app is open/foreground; quitting or launching a game lets the system take the light bar back. Console RGB is not possible in software.
+
 
 PS4 homebrew (OpenOrbis) that changes the DualShock 4 light bar colour.
 Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 
 - **Title ID:** RGBB00001
-- **Content ID:** IV0000-RGBB00001_00-RGBBARCONTROL00
+- **Content ID:** IV0000-RGBB00001_00-RGBBARCONTROL000
 - **Build:** open the folder in VS Code and press Ctrl+Shift+B, or run `make` in a terminal with `OO_PS4_TOOLCHAIN` set and `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
 
 ## How it works

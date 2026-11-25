@@ -1,4 +1,17 @@
-// RGB-Controller v1.03 — PS4 homebrew (OpenOrbis)
+// RGB-Controller v1.03.1 — PS4 homebrew (OpenOrbis)
+//
+// v1.03.1 fixes 1.03 audio (tested 2026-11-25: skippy on TV, silent on pad):
+//   Audio now runs on its OWN thread (std::thread, as in the toolchain
+//   threading sample), feeding exactly one 256-sample grain per iteration
+//   with the audio-wav sample pattern Output(h, NULL) then Output(h, grain).
+//   In 1.03 the MAIN thread fed 19 grains (~101 ms) then did a full 1080p
+//   Scene2D render + flip (tens of ms) before feeding again, so every cycle
+//   had a silence gap and the TV stuttered; the pad port, with its tiny
+//   buffer, starved completely. The audio thread is paced only by the audio
+//   hardware, so graphics/input can never starve it. Mode changes are a
+//   request flag the audio thread applies itself; handles are owned only
+//   by the audio thread. Pad open now tries the login user first, then the
+//   SYSTEM user, and logs BOTH return codes.
 //
 // v1.03 adds music out of the DualShock 4 controller speaker (roadmap v3):
 //   Default track (LOOPED): "Sony's Playstation 4 Start-up Tune (TXZ1'S EPIC
@@ -38,6 +51,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <thread>
+#include <atomic>
 
 #include "graphics.h"
 #include "log.h"
@@ -97,58 +112,53 @@ static void LogLine(const char *line)
     }
 }
 
-// ---- Audio (v1.03) ----
-// Controller-speaker port: NOT defined in the OpenOrbis headers (only
-// ORBIS_AUDIO_OUT_PORT_TYPE_MAIN = 0 is). Value 3 is the pad-speaker port
-// in the official PS4 SDK (MAIN=0, BGM=1, VOICE=2, PADSPK=3). UNVERIFIED
-// on real hardware — if sceAudioOutOpen rejects it, the return code is
-// logged + shown on screen and the app carries on without pad audio.
+// ---- Audio (v1.03.1: dedicated audio thread) ----
+// PADSPK port: NOT defined in OpenOrbis headers (only MAIN = 0 is).
+// Value 3 is the pad-speaker port in the official PS4 SDK order
+// (MAIN=0, BGM=1, VOICE=2, PADSPK=3). Still UNVERIFIED on real hardware:
+// the open return codes are logged + shown on screen, and if the login
+// user fails, the SYSTEM user is tried as a fallback and both rcs logged.
 #define ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK ((OrbisAudioOutPort)3)
 
-static int audioMode = 0; // 0 Pad speaker, 1 TV, 2 Both, 3 Off. Default: Pad.
-static int32_t g_audioPad = -1;  // PADSPK handle, or -1 if not open
-static int32_t g_audioTv = -1;   // MAIN (TV) handle, or -1 if not open
-static int16_t *g_pcm = nullptr; // decoded track: 48kHz mono s16 samples
-static size_t g_pcmSamples = 0;  // total mono samples in g_pcm
-static size_t g_playPos = 0;     // next sample to play (wraps = loop)
-static bool g_audioFailed = false; // a feed call errored; stop feeding
+static int audioMode = 0; // main-thread display copy: 0 Pad, 1 TV, 2 Both, 3 Off
+static std::atomic<int> g_audioModeReq{-1}; // main -> audio thread: apply this mode
+static std::atomic<bool> g_audioThreadRun{true};
+static std::atomic<bool> g_audioBothFailed{false}; // audio -> main: Both fell back to Pad
+static std::atomic<long> g_audioGrainsFed{0};
+static int g_audioModeCurrent = -1; // audio-thread owned
+static int32_t g_audioUserId = 0;   // login user, set in main before thread starts
+static int32_t g_audioPad = -1;     // audio-thread owned
+static int32_t g_audioTv = -1;      // audio-thread owned
+static int16_t *g_pcm = nullptr;
+static size_t g_pcmSamples = 0;
+static size_t g_playPos = 0;        // audio-thread owned (wraps = loop)
+static bool g_audioFailed = false;  // audio-thread owned
 static int32_t g_audioInitRc = -999;
 static int32_t g_audioPadRc = -999;
 static int32_t g_audioTvRc = -999;
 static char g_audioStatus[160] = "not started";
+static bool g_audioFedOnce = false; // per mode, for the first-grain log line
 
 static void AudioCloseAll()
 {
-    if (g_audioPad >= 0)
-    {
-        sceAudioOutClose(g_audioPad);
-        g_audioPad = -1;
-    }
-    if (g_audioTv >= 0)
-    {
-        sceAudioOutClose(g_audioTv);
-        g_audioTv = -1;
-    }
+    if (g_audioPad >= 0) { sceAudioOutClose(g_audioPad); g_audioPad = -1; }
+    if (g_audioTv >= 0) { sceAudioOutClose(g_audioTv); g_audioTv = -1; }
 }
 
-// (Re)open the audio ports for the current audioMode. Called at startup
-// and whenever the Audio menu row changes. Never hangs the app: a failed
-// open just leaves that handle at -1 and records the return code.
-static void AudioApplyMode(int32_t userId)
+// Audio-thread only. (Re)opens ports for `mode`. Never hangs the app:
+// a failed open leaves that handle at -1 and records the return code.
+static void AudioApplyMode(int mode)
 {
     AudioCloseAll();
     g_audioPadRc = -999;
     g_audioTvRc = -999;
+    g_audioFailed = false;
+    g_audioFedOnce = false;
+    g_audioModeCurrent = mode;
     if (g_audioInitRc != 0)
     {
         snprintf(g_audioStatus, sizeof(g_audioStatus), "audio lib init FAILED rc=%d", (int)g_audioInitRc);
         LogLine("Audio: not opening ports, sceAudioOutInit failed");
-        return;
-    }
-    if (g_audioFailed)
-    {
-        snprintf(g_audioStatus, sizeof(g_audioStatus), "FAILED earlier, not reopening");
-        LogLine("Audio: not reopening (earlier feed failure)");
         return;
     }
     if (!g_pcm || g_pcmSamples == 0)
@@ -156,100 +166,115 @@ static void AudioApplyMode(int32_t userId)
         snprintf(g_audioStatus, sizeof(g_audioStatus), "No PCM loaded");
         return;
     }
-    if (audioMode == 3) // Off
+    if (mode == 3) // Off
     {
         snprintf(g_audioStatus, sizeof(g_audioStatus), "Off");
         LogLine("Audio: Off");
         return;
     }
     char buf[200];
-    if (audioMode == 0 || audioMode == 2)
+    if (mode == 0 || mode == 2)
     {
-        // Pad speaker: mono 48kHz s16, same grain size (256) as the
-        // toolchain audio-wav sample. UserId = the pad's login user.
-        g_audioPad = sceAudioOutOpen(userId, ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK, 0, 256, 48000,
+        // Pad speaker: mono 48kHz s16, grain 256. Try the login user first,
+        // then SYSTEM — both return codes are logged so a real-hardware
+        // test can tell us which (if either) the pad port accepts.
+        g_audioPad = sceAudioOutOpen(g_audioUserId, ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK, 0, 256, 48000,
                                      ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
         g_audioPadRc = g_audioPad;
-        if (g_audioPad <= 0)
-            g_audioPad = -1;
-        snprintf(buf, sizeof(buf), "sceAudioOutOpen PADSPK handle/rc=%d", (int)g_audioPadRc);
+        snprintf(buf, sizeof(buf), "sceAudioOutOpen PADSPK user=%d handle/rc=%d", (int)g_audioUserId, (int)g_audioPadRc);
         LogLine(buf);
+        if (g_audioPad <= 0)
+        {
+            int32_t alt = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_PADSPK, 0, 256, 48000,
+                                          ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
+            snprintf(buf, sizeof(buf), "sceAudioOutOpen PADSPK SYSTEM user handle/rc=%d", (int)alt);
+            LogLine(buf);
+            if (alt > 0) { g_audioPad = alt; g_audioPadRc = alt; }
+            else g_audioPad = -1;
+        }
+        if (g_audioPad <= 0) g_audioPad = -1;
     }
-    if (audioMode == 1 || audioMode == 2)
+    if (mode == 1 || mode == 2)
     {
-        // TV: stereo 48kHz s16 on MAIN — the exact pattern from the
-        // toolchain audio-wav sample (SYSTEM user, MAIN port).
+        // TV: stereo 48kHz s16 on MAIN, SYSTEM user — the toolchain
+        // audio-wav sample pattern.
         g_audioTv = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
                                     ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
         g_audioTvRc = g_audioTv;
-        if (g_audioTv <= 0)
-            g_audioTv = -1;
+        if (g_audioTv <= 0) g_audioTv = -1;
         snprintf(buf, sizeof(buf), "sceAudioOutOpen MAIN handle/rc=%d", (int)g_audioTvRc);
         LogLine(buf);
     }
-    if (audioMode == 0)
-        snprintf(g_audioStatus, sizeof(g_audioStatus), "Pad spk %s", (g_audioPad >= 0) ? "OK" : "OPEN FAILED");
-    else if (audioMode == 1)
-        snprintf(g_audioStatus, sizeof(g_audioStatus), "TV %s", (g_audioTv >= 0) ? "OK" : "OPEN FAILED");
+    if (mode == 0)
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Pad spk %s (rc=%d)", (g_audioPad >= 0) ? "OK" : "OPEN FAILED", (int)g_audioPadRc);
+    else if (mode == 1)
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "TV %s (rc=%d)", (g_audioTv >= 0) ? "OK" : "OPEN FAILED", (int)g_audioTvRc);
     else
-        snprintf(g_audioStatus, sizeof(g_audioStatus), "Both: pad %s / TV %s",
-                 (g_audioPad >= 0) ? "OK" : "FAILED", (g_audioTv >= 0) ? "OK" : "FAILED");
-    snprintf(buf, sizeof(buf), "Audio mode -> %s (%s)", kAudioNames[audioMode], g_audioStatus);
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Both: pad %s (rc=%d) / TV %s (rc=%d)",
+                 (g_audioPad >= 0) ? "OK" : "FAILED", (int)g_audioPadRc,
+                 (g_audioTv >= 0) ? "OK" : "FAILED", (int)g_audioTvRc);
+    snprintf(buf, sizeof(buf), "Audio mode -> %s (%s)", kAudioNames[mode], g_audioStatus);
     LogLine(buf);
 }
 
-// Feed ~101 ms of audio (19 grains x 256 samples @ 48kHz) to every open
-// port, looping the track when the end is reached. Mirrors the toolchain
-// audio-wav sample: sceAudioOutOutput(handle, NULL) waits for the previous
-// grain, then Output(handle, grain) queues the next one. Output blocks
-// until the grain is consumed, so this paces the main loop at ~real time
-// while music is playing (the fixed 100 ms sleep is skipped on fed ticks).
-// Returns true if any audio was fed this tick.
-// On a feed error: logs it, closes the ports, stops feeding for good
-// (music off, menu + light bars keep working).
-static bool AudioFeedTick()
+// Audio thread: feeds ONE 256-sample grain per iteration, exactly like
+// the toolchain audio-wav sample (Output(h, NULL) waits for the previous
+// grain, then Output(h, grain) queues the next). The NULL-wait paces the
+// thread at ~real time (~5.33 ms/grain @ 48 kHz), so graphics/input on
+// the main thread can never starve the audio — that starvation is what
+// made 1.03 skip on TV. Loop wraps g_playPos at the end of the track.
+static void AudioThreadMain()
 {
-    if (!g_pcm || g_pcmSamples == 0 || g_audioFailed)
-        return false;
-    if (g_audioPad < 0 && g_audioTv < 0)
-        return false;
     int16_t monoGrain[256];
     int16_t stereoGrain[256 * 2];
-    for (int g = 0; g < 19; g++) // 19 x 256 = 4864 samples ~ 101 ms
+    while (g_audioThreadRun.load())
     {
+        int req = g_audioModeReq.exchange(-1);
+        if (req >= 0)
+            AudioApplyMode(req);
+        if (!g_pcm || g_pcmSamples == 0 || g_audioFailed || (g_audioPad < 0 && g_audioTv < 0))
+        {
+            sceKernelUsleep(10000);
+            continue;
+        }
         for (int i = 0; i < 256; i++)
         {
             monoGrain[i] = g_pcm[g_playPos];
-            g_playPos++;
-            if (g_playPos >= g_pcmSamples)
-                g_playPos = 0; // loop
+            if (++g_playPos >= g_pcmSamples) g_playPos = 0; // loop
         }
         int32_t rc = 0;
         if (g_audioPad >= 0 && g_audioTv >= 0)
         {
-            // Both: one sceAudioOutOutputs call feeds both ports the same
-            // grain at the same time (mono to the pad, mono duplicated to
-            // stereo for the TV). No NULL-wait here: Outputs' NULL-pointer
-            // behaviour is undocumented, so only the data call is used.
             for (int i = 0; i < 256; i++)
             {
                 stereoGrain[i * 2] = monoGrain[i];
                 stereoGrain[i * 2 + 1] = monoGrain[i];
             }
+            // Wait for both ports, then feed both at once. If the NULL
+            // wait is not supported by Outputs, log it and feed anyway.
+            OrbisAudioOutOutputParam waitParams[2];
+            waitParams[0].handle = g_audioPad; waitParams[0].pointer = nullptr;
+            waitParams[1].handle = g_audioTv;  waitParams[1].pointer = nullptr;
+            int32_t wrc = sceAudioOutOutputs(waitParams, 2);
+            if (wrc < 0)
+            {
+                char buf[160];
+                snprintf(buf, sizeof(buf), "WARN: sceAudioOutOutputs NULL-wait rc=%d, feeding without wait", (int)wrc);
+                LogLine(buf);
+            }
             OrbisAudioOutOutputParam params[2];
-            params[0].handle = g_audioPad;
-            params[0].pointer = monoGrain;
-            params[1].handle = g_audioTv;
-            params[1].pointer = stereoGrain;
+            params[0].handle = g_audioPad; params[0].pointer = monoGrain;
+            params[1].handle = g_audioTv;  params[1].pointer = stereoGrain;
             rc = sceAudioOutOutputs(params, 2);
             if (rc < 0)
             {
-                // "Both" via sceAudioOutOutputs failed — fall back to Pad
-                // speaker only for the rest of this session, don't die.
+                // Both failed: fall back to Pad speaker only, tell the
+                // main thread to show Pad in the menu.
                 LogLine("WARN: sceAudioOutOutputs (Both) failed, falling back to Pad only");
                 sceAudioOutClose(g_audioTv);
                 g_audioTv = -1;
-                audioMode = 0;
+                g_audioModeCurrent = 0;
+                g_audioBothFailed.store(true);
                 snprintf(g_audioStatus, sizeof(g_audioStatus), "Both FAILED -> Pad spk %s",
                          (g_audioPad >= 0) ? "OK" : "OPEN FAILED");
                 rc = sceAudioOutOutput(g_audioPad, monoGrain);
@@ -257,7 +282,7 @@ static bool AudioFeedTick()
         }
         else if (g_audioPad >= 0)
         {
-            sceAudioOutOutput(g_audioPad, NULL); // wait for previous grain
+            sceAudioOutOutput(g_audioPad, NULL);
             rc = sceAudioOutOutput(g_audioPad, monoGrain);
         }
         else
@@ -267,29 +292,37 @@ static bool AudioFeedTick()
                 stereoGrain[i * 2] = monoGrain[i];
                 stereoGrain[i * 2 + 1] = monoGrain[i];
             }
-            sceAudioOutOutput(g_audioTv, NULL); // wait for previous grain
+            sceAudioOutOutput(g_audioTv, NULL);
             rc = sceAudioOutOutput(g_audioTv, stereoGrain);
         }
         if (rc < 0)
         {
             char buf[192];
-            snprintf(buf, sizeof(buf), "Audio feed FAILED rc=%d (pad=%d tv=%d) — music stopped, menu still works",
-                     (int)rc, (int)g_audioPad, (int)g_audioTv);
+            snprintf(buf, sizeof(buf), "Audio feed FAILED rc=%d (pad=%d tv=%d) grainsFed=%ld — music stopped, menu still works",
+                     (int)rc, (int)g_audioPad, (int)g_audioTv, g_audioGrainsFed.load());
             LogLine(buf);
             snprintf(g_audioStatus, sizeof(g_audioStatus), "FEED FAILED rc=%d", (int)rc);
             g_audioFailed = true;
             AudioCloseAll();
-            return false;
+            continue;
+        }
+        g_audioGrainsFed.fetch_add(1);
+        if (!g_audioFedOnce)
+        {
+            g_audioFedOnce = true;
+            char buf[160];
+            snprintf(buf, sizeof(buf), "Audio: first grain fed OK (%s)", g_audioStatus);
+            LogLine(buf);
         }
     }
-    return true;
 }
+
 
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     g_log = fopen("/data/rgb_log.txt", "w");
-    LogLine("RGB-Controller v1.03 starting...");
+    LogLine("RGB-Controller v1.03.1 starting...");
 
     // ---- On-screen display (best effort: pads still work without it)
     Scene2D *scene = nullptr;
@@ -436,7 +469,10 @@ int main(void)
     {
         LogLine("WARN: sceAudioOutInit failed — music disabled");
     }
-    AudioApplyMode(initialUser);
+    g_audioUserId = initialUser;
+    g_audioModeReq.store(0); // default: Pad speaker; audio thread opens it
+    std::thread audioThread(AudioThreadMain);
+    audioThread.detach();
 
     // ---- v1.02 state (kept)
     // mode: 0 PRESETS, 1 DISCO, 2 CUSTOM. Start on PRESETS (v1 look).
@@ -501,7 +537,7 @@ int main(void)
             break;
         case 7: // Audio output: Pad speaker / TV / Both / Off
             audioMode = (audioMode + dir + 4) % 4;
-            AudioApplyMode(initialUser);
+            g_audioModeReq.store(audioMode); // audio thread applies it
             break;
         }
     };
@@ -551,7 +587,7 @@ int main(void)
             Color grey = {180, 180, 180};
             char line[256];
             scene->DrawText((char *)"RGB-CONTROLLER", fontLarge, 120, 180, black, white);
-            scene->DrawText((char *)"v1.03 - Menu + RGB Sliders + Disco Speed + Music", fontSmall, 120, 280, black, white);
+            scene->DrawText((char *)"v1.03.1 - Menu + RGB Sliders + Disco Speed + Music (audio thread fix)", fontSmall, 120, 280, black, white);
             snprintf(line, sizeof(line), "MODE: %s   hue %d   Disco speed: %s (%d/5)",
                      kModeNames[mode], hue, kSpeedNames[discoSpeed], discoSpeed);
             scene->DrawText(line, fontSmall, 120, 350, black, white);
@@ -612,7 +648,7 @@ int main(void)
         frameID++;
     };
 
-    LogLine("v1.03 menu running — D-pad to move, Left/Right to adjust, X to confirm");
+    LogLine("v1.03.1 menu running — D-pad to move, Left/Right to adjust, X to confirm");
     for (;;)
     {
         // ---- Input (Pad 1 only), edge + hold-repeat for Left/Right.
@@ -678,13 +714,17 @@ int main(void)
                 colours[i] = kPresets[i % 4];
         }
 
-        // ---- Music: feed ~101 ms of PCM (blocks ~real time while playing).
-        bool fedAudio = AudioFeedTick();
+        // ---- Music runs on its own thread now (v1.03.1): main loop
+        // never feeds audio, so rendering can never starve it.
+        if (g_audioBothFailed.exchange(false))
+        {
+            audioMode = 0; // Both fell back to Pad only; show that in menu
+            LogLine("Audio: Both failed, menu now shows Pad speaker");
+        }
         tick(colours);
         if (mode == 1)
             hue = (hue + discoSpeed * 2) % 360; // 100ms tick: speed 3 = 6deg/tick
-        if (!fedAudio)
-            sceKernelUsleep(100000);
+        sceKernelUsleep(100000);
     }
 
     return 0;

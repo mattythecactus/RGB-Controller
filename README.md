@@ -63,6 +63,54 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - Music (like the colours) only plays while this app is open in the
   foreground. Quitting stops it.
 
+## Release notes — 1.03.1
+
+**RGB-Controller 1.03.1** — audio fix for 1.03 (tested 2026-11-25: skippy
+on TV, silent on controller speaker).
+- **Root cause of the skipping:** in 1.03 the MAIN thread fed audio in
+  bursts of 19 grains (~101 ms of sound) and then did a full 1080p
+  Scene2D render + flip (tens of ms) before feeding again. Every cycle
+  therefore had a silence gap, so the TV stuttered. The controller
+  speaker, with its much smaller buffer, starved completely and stayed
+  silent. The toolchain audio-wav sample never does anything but feed
+  audio — that is the pattern that works.
+- **Fix:** audio now runs on its OWN thread (`std::thread`, as in the
+  toolchain threading sample). It feeds exactly ONE 256-sample grain per
+  iteration with the sample pattern `sceAudioOutOutput(h, NULL)` (wait
+  for the previous grain) then `sceAudioOutOutput(h, grain)`. The
+  NULL-wait paces the thread at ~real time (~5.33 ms/grain @ 48 kHz), so
+  graphics/input on the main thread can never starve the audio again.
+  Mode changes are a request flag the audio thread applies itself;
+  audio handles are owned only by the audio thread.
+- **Pad speaker:** port value is still 3 (MAIN=0, BGM=1, VOICE=2,
+  PADSPK=3), still unverified in the OpenOrbis headers — no authoritative
+  source for a different value could be found. 1.03.1 now tries the
+  login user first, then the SYSTEM user, and logs BOTH
+  `sceAudioOutOpen PADSPK` return codes, plus the first grain fed, so
+  the next test can say definitively whether port 3 opens at all. With
+  the thread fix, a working port should now actually be heard instead
+  of starving. If it still says "Pad spk OPEN FAILED", the return code
+  in /data/rgb_log.txt is the key evidence.
+  **Test result 2026-11-25: the pad speaker is difficult to get working
+  and still does NOT play — no sound from the controller in testing,
+  even after the thread fix. The port value (3) remains unverified and
+  may be wrong, or the pad speaker may need a different call/params
+  than sceAudioOut. TV is the working output for now.**
+- "Both" now waits on both ports with `sceAudioOutOutputs` (NULL
+  pointers) before feeding both, and falls back to Pad only if that
+  fails, telling the main thread to show Pad in the menu. A feed failure
+  no longer kills music for good — switching the Audio row re-opens the
+  ports and retries.
+- Kept from 1.03: looped PS4 startup tune, Audio row (Pad speaker / TV
+  / Both / Off, default Pad speaker), 8-row menu, R/G/B sliders,
+  presets, disco speed, return codes, /data/rgb_log.txt logging, rumble
+  pulse, icon.
+- PKG built 2026-11-25, version 1.03.1, same filename
+  IV0000-RGBB00001_00-RGBBARCONTROL000.pkg, ~33.5 MB.
+  **Tested 2026-11-25 on Baikal PS4 Slim: TV speaker works — smooth,
+  no skipping (thread fix confirmed). Pad / controller speaker is
+  difficult to get working and does NOT work yet — see below.**
+
 ## Release notes — 1.02
 
 **RGB-Controller 1.02** — on-screen menu + R/G/B sliders + disco speed control.
@@ -159,6 +207,22 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - Also re-check the 1.02 menu still works (all 8 rows now) — the Audio
   row is the only new one.
 
+### 1.03.1 test — TESTED 2026-11-25, Baikal PS4 Slim (CUH-2202A, FW 9.00, GoldHEN)
+- **TV: TESTED, WORKS — smooth, no skipping.** Set Audio to TV and the
+  tune plays smoothly and loops every 4:19. The audio-thread fix is
+  confirmed.
+- **Pad speaker: TESTED, DOES NOT WORK.** No sound from the controller
+  speaker, even after the thread fix. The pad speaker is difficult to
+  get working — port value 3 is unverified in the OpenOrbis headers and
+  may be wrong, or it may need a different call/params. The
+  `sceAudioOutOpen PADSPK` return codes in /data/rgb_log.txt (login
+  user + SYSTEM user) are the key evidence for the next attempt.
+- Try Both: tune from pad AND TV at once. Try Off: silence. Switching
+  back should resume and re-open the ports.
+- If you hear nothing anywhere, check /data/rgb_log.txt for
+  `sceAudioOutInit`, `PCM loaded`, `sceAudioOutOpen`, and
+  `Audio: first grain fed OK` — they say exactly which step failed.
+
 ## How it works
 
 - Gets the real login user with `sceUserServiceGetInitialUser`, opens
@@ -179,6 +243,9 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
   ports in 256-sample grains with `sceAudioOutOutput` / `sceAudioOutOutputs`,
   looping at the end of the track. Pad speaker = PADSPK port (value 3,
   unverified — see limits above), TV = MAIN port, Both = both at once.
+- Music (1.03.1): the feeding moved to a dedicated audio thread — one
+  grain per iteration, `Output(h, NULL)` then `Output(h, grain)`, paced
+  by the audio hardware, so rendering can never starve it.
 
 ## Versions
 
@@ -188,9 +255,14 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 - **1.01:** light-bar fix, on-screen display, new icon. Tested 2026-11-25: works.
 - **1.02:** on-screen menu with R/G/B sliders per pad, presets,
   disco speed control. Tested 2026-11-25: works — disco speed and sliders tested on Baikal Slim.
-- **1.03 (this build):** music / audio out of the DualShock 4
-  controller speaker — default track looped, Audio menu row (Pad
-  speaker / TV / Both / Off). Untested on real PS4 yet.
+- **1.03:** music / audio out of the DualShock 4 controller speaker —
+  default track looped, Audio menu row (Pad speaker / TV / Both / Off).
+  Tested 2026-11-25: audio skippy on TV, silent on controller speaker.
+- **1.03.1 (this build):** audio-thread fix — music fed on its own
+  thread (one grain at a time, paced by the audio hardware), pad open
+  tries login user then SYSTEM user with both return codes logged.
+  Tested 2026-11-25: TV smooth, no skipping; pad speaker difficult
+  to get working and does NOT work yet.
 - **1.04 (planned, future only):** custom music selectable — let the user
   pick their own music/audio file to play through the controller
   speaker (from 1.03), e.g. choose a track in the menu.

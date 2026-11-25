@@ -80,7 +80,8 @@ Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
   still do not change, the on-screen return codes and
   `/data/rgb_log.txt` say exactly which call failed.
 
-### 1.02 test — needs Matty on real PS4 (not tested yet, built while he napped)
+### 1.02 test — TESTED 2026-11-25, Baikal PS4 Slim (CUH-2202A, FW 9.00, GoldHEN): disco speed and sliders work
+- Tested 2026-11-25 on Baikal PS4 Slim: disco speed control works and R/G/B sliders work.
 - Install the 1.02 PKG from /media/matt/PS4DATA/pkg/ (copy it there first — USB was unplugged).
 - Check the menu shows: Mode / Pad / Red / Green / Blue / Preset / Disco speed.
 - D-pad Up/Down moves the > cursor; Left/Right changes the value; hold Left/Right to repeat.

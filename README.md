@@ -3,6 +3,10 @@
 PS4 homebrew (OpenOrbis) that changes the DualShock 4 light bar colour.
 Built with the OpenOrbis PS4 Toolchain v0.5.4 on Linux Mint.
 
+> **Tested on Baikal PS4 Slim (CUH-2202A, firmware 9.00, GoldHEN)** — Baikal is the Slim/Pro southbridge.
+> **Very early stage project** — very early setup, expect rough edges and changes.
+> **Vibe-coded** — built AI-assisted (vibe coded) with Muse / OpenOrbis.
+
 - **Title ID:** RGBB00001
 - **Content ID:** IV0000-RGBB00001_00-RGBBARCONTROL000
 - **Build:** open the folder in VS Code and press Ctrl+Shift+B, or run `make` in a terminal with `OO_PS4_TOOLCHAIN` set and `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.

@@ -1,4 +1,18 @@
-// RGB-Controller v1.03.1 — PS4 homebrew (OpenOrbis)
+// RGB-Controller v1.04 — PS4 homebrew (OpenOrbis)
+//
+// v1.04 adds custom music (roadmap v4, part 1 — FTP folder + Track menu):
+//   The app creates /data/rgb_music/ on the PS4 on startup (mkdir, logged).
+//   FTP .pcm files there (see README "Custom music via FTP") and the app
+//   lists them in the new Track menu row alongside the bundled PS4 startup
+//   tune. Tracks are raw 48 kHz mono 16-bit PCM only — MP3s cannot be
+//   decoded on the console (no usable decoder in this toolchain), so MP3s
+//   must be converted on the laptop first with ffmpeg (see README).
+//   Track switching is a request flag to the audio thread (like Audio
+//   mode): the audio thread frees the old PCM, loads the new file, resets
+//   the play position and keeps looping. Bundled tracks (v1.04): Track 1
+//   PS4 startup tune, Track 2 Bee Gees "Stayin' Alive (San Pacho Remix)",
+//   Track 3 "Coffin Dance" — converted at build time with ffmpeg to raw
+//   48 kHz mono s16 PCM; the original MP3s are also in assets/audio/.
 //
 // v1.03.1 fixes 1.03 audio (tested 2026-11-25: skippy on TV, silent on pad):
 //   Audio now runs on its OWN thread (std::thread, as in the toolchain
@@ -33,7 +47,7 @@
 //   (same sceAudioOutOpen pattern as the toolchain's audio-wav sample).
 //   "Both" relies on sceAudioOutOutputs, also untested on real hardware:
 //   if it fails, the app falls back to Pad speaker only and logs it.
-// Menu rows (8): Mode, Pad, Red, Green, Blue, Preset, Disco Speed, Audio.
+// Menu rows (9): Mode, Pad, Red, Green, Blue, Preset, Disco Speed, Audio, Track.
 // R/G/B sliders are per pad (0-255 each); Pad can be 1-4 or All.
 // Presets apply to the selected pad (or All) and switch to Custom mode.
 // Disco speed 1-5 controls the hue-cycle speed.
@@ -53,6 +67,12 @@
 #include <cstdlib>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <algorithm>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <cerrno>
 
 #include "graphics.h"
 #include "log.h"
@@ -138,6 +158,202 @@ static int32_t g_audioPadRc = -999;
 static int32_t g_audioTvRc = -999;
 static char g_audioStatus[160] = "not started";
 static bool g_audioFedOnce = false; // per mode, for the first-grain log line
+
+// ---- Tracks (v1.04) ----
+// Track 0 is always the bundled PS4 startup tune, Track 1 is Stayin'
+// Alive and Track 2 is Coffin Dance (both bundled, converted at build
+// time); the rest are .pcm files found in /data/rgb_music/ (FTP folder,
+// created on startup). The list is
+// written only by the main thread (startup scan + rescan on entering the
+// Track row) and read by the audio thread only when applying a track
+// request, under g_trackListMutex. Main-thread display reads are safe:
+// a rescan only runs when no track request is pending.
+#define FTP_MUSIC_DIR "/data/rgb_music"
+#define BUNDLED_TRACK_PATH "/app0/assets/audio/ps4_startup.pcm"
+#define BUNDLED_TRACK2_PATH "/app0/assets/audio/stayin_alive.pcm"
+#define BUNDLED_TRACK3_PATH "/app0/assets/audio/coffin_dance.pcm"
+struct TrackEntry
+{
+    char name[64];
+    char path[192];
+};
+static const int kMaxTracks = 16;
+static TrackEntry g_tracks[kMaxTracks];
+static int g_trackCount = 0;
+static int g_trackIdx = 0; // main-thread display copy
+static std::atomic<int> g_trackReq{-1}; // main -> audio thread: load this track
+static std::mutex g_trackListMutex;
+
+static bool EndsWithPcm(const char *n)
+{
+    size_t l = strlen(n);
+    if (l < 5)
+        return false;
+    const char *e = n + l - 4;
+    return (e[0] == '.' && (e[1] == 'p' || e[1] == 'P') && (e[2] == 'c' || e[2] == 'C') &&
+            (e[3] == 'm' || e[3] == 'M'));
+}
+
+// Caller must hold g_trackListMutex. Display name = filename without .pcm,
+// '_' shown as ' ', truncated to fit.
+static void AddTrackLocked(const char *displayName, const char *path)
+{
+    if (g_trackCount >= kMaxTracks)
+        return;
+    TrackEntry &t = g_tracks[g_trackCount];
+    snprintf(t.name, sizeof(t.name), "%s", displayName);
+    snprintf(t.path, sizeof(t.path), "%s", path);
+    g_trackCount++;
+}
+
+// Main thread only. Rebuilds the track list: bundled tune first, then
+// .pcm files in /data/rgb_music/, alphabetically. Skips empty, odd-sized
+// and >100 MB files (they cannot be played as 48 kHz mono s16 PCM).
+static void ScanFtpTracks()
+{
+    std::lock_guard<std::mutex> lock(g_trackListMutex);
+    g_trackCount = 0;
+    AddTrackLocked("PS4 Startup", BUNDLED_TRACK_PATH);
+    AddTrackLocked("Stayin' Alive", BUNDLED_TRACK2_PATH);
+    AddTrackLocked("Coffin Dance", BUNDLED_TRACK3_PATH);
+    DIR *d = opendir(FTP_MUSIC_DIR);
+    if (!d)
+    {
+        LogLine("FTP music: /data/rgb_music/ not found (mkdir may have failed) — bundled track only");
+        return;
+    }
+    // Collect .pcm filenames first, so the list is alphabetical.
+    char names[13][128];
+    int nFound = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != nullptr && nFound < 13) // 3 bundled + 13 FTP = 16 max
+    {
+        if (!EndsWithPcm(ent->d_name))
+            continue;
+        char full[256];
+        snprintf(full, sizeof(full), "%s/%s", FTP_MUSIC_DIR, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0)
+            continue;
+        if (st.st_size <= 0 || (st.st_size % 2) != 0 || st.st_size > 100 * 1024 * 1024)
+        {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "FTP music: skipping %s (size %ld, must be non-empty even .pcm <= 100 MB)",
+                     ent->d_name, (long)st.st_size);
+            LogLine(buf);
+            continue;
+        }
+        snprintf(names[nFound], sizeof(names[nFound]), "%s", ent->d_name);
+        nFound++;
+    }
+    closedir(d);
+    // Alphabetical order (simple bubble sort — names are fixed char arrays).
+    for (int i = 0; i < nFound; i++)
+        for (int j = i + 1; j < nFound; j++)
+            if (strcmp(names[j], names[i]) < 0)
+            {
+                char tmp[128];
+                snprintf(tmp, sizeof(tmp), "%s", names[i]);
+                snprintf(names[i], sizeof(names[i]), "%s", names[j]);
+                snprintf(names[j], sizeof(names[j]), "%s", tmp);
+            }
+    for (int i = 0; i < nFound; i++)
+    {
+        char display[64];
+        snprintf(display, sizeof(display), "%s", names[i]);
+        size_t l = strlen(display);
+        if (l >= 4)
+            display[l - 4] = '\0'; // strip .pcm
+        for (size_t k = 0; display[k]; k++)
+            if (display[k] == '_')
+                display[k] = ' ';
+        char full[256];
+        snprintf(full, sizeof(full), "%s/%s", FTP_MUSIC_DIR, names[i]);
+        AddTrackLocked(display, full);
+    }
+    char buf[160];
+    snprintf(buf, sizeof(buf), "FTP music: %d track(s) total (3 bundled + %d from /data/rgb_music/)",
+             g_trackCount, g_trackCount - 3);
+    LogLine(buf);
+    for (int i = 0; i < g_trackCount; i++)
+    {
+        snprintf(buf, sizeof(buf), "  Track %d: %s", i + 1, g_tracks[i].name);
+        LogLine(buf);
+    }
+}
+
+// Audio-thread only. Loads the track at `idx` (copies path/name under the
+// list mutex, loads outside it): frees the old PCM, reads the new file,
+// resets the play position so the new track loops from the start.
+static bool LoadTrack(int idx)
+{
+    char path[192] = "";
+    char name[64] = "";
+    {
+        std::lock_guard<std::mutex> lock(g_trackListMutex);
+        if (idx < 0 || idx >= g_trackCount)
+        {
+            LogLine("Track: bad index, ignoring");
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s", g_tracks[idx].path);
+        snprintf(name, sizeof(name), "%s", g_tracks[idx].name);
+    }
+    if (g_pcm)
+    {
+        free(g_pcm);
+        g_pcm = nullptr;
+    }
+    g_pcmSamples = 0;
+    g_playPos = 0;
+    g_audioFailed = false;
+    g_audioFedOnce = false;
+    FILE *af = fopen(path, "rb");
+    if (!af)
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "WARN: Track '%s' missing (%s) — music disabled until another track is picked", name, path);
+        LogLine(buf);
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Track missing: %s", name);
+        return false;
+    }
+    fseek(af, 0, SEEK_END);
+    long sz = ftell(af);
+    fseek(af, 0, SEEK_SET);
+    bool ok = false;
+    if (sz > 0 && (sz % 2) == 0)
+    {
+        g_pcm = (int16_t *)malloc((size_t)sz);
+        if (g_pcm && fread(g_pcm, 1, (size_t)sz, af) == (size_t)sz)
+        {
+            g_pcmSamples = (size_t)sz / 2;
+            ok = true;
+        }
+        else
+        {
+            if (g_pcm)
+            {
+                free(g_pcm);
+                g_pcm = nullptr;
+            }
+        }
+    }
+    fclose(af);
+    char buf[256];
+    if (ok)
+    {
+        snprintf(buf, sizeof(buf), "Track -> %s: %zu samples = %zu:%02zu @ 48kHz mono (%ld bytes)",
+                 name, g_pcmSamples, g_pcmSamples / 48000 / 60, (g_pcmSamples / 48000) % 60, sz);
+        LogLine(buf);
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "WARN: Track '%s' has odd/empty size or read failed — music disabled until another track is picked", name);
+        LogLine(buf);
+        snprintf(g_audioStatus, sizeof(g_audioStatus), "Track load FAILED: %s", name);
+    }
+    return ok;
+}
 
 static void AudioCloseAll()
 {
@@ -229,6 +445,9 @@ static void AudioThreadMain()
     int16_t stereoGrain[256 * 2];
     while (g_audioThreadRun.load())
     {
+        int treq = g_trackReq.exchange(-1);
+        if (treq >= 0)
+            LoadTrack(treq); // track first, so the mode apply below sees the new PCM
         int req = g_audioModeReq.exchange(-1);
         if (req >= 0)
             AudioApplyMode(req);
@@ -322,7 +541,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     g_log = fopen("/data/rgb_log.txt", "w");
-    LogLine("RGB-Controller v1.03.1 starting...");
+    LogLine("RGB-Controller v1.04 starting...");
 
     // ---- On-screen display (best effort: pads still work without it)
     Scene2D *scene = nullptr;
@@ -416,60 +635,32 @@ int main(void)
         LogLine(buf);
     }
 
-    // ---- Audio (v1.03): init lib, load decoded PCM, open ports for the
-    // default mode (Pad speaker). Music is best-effort: any failure here
-    // only disables music, never the light bars or the menu.
+    // ---- Audio (v1.04): init lib, create the FTP music folder, scan
+    // tracks, and let the audio thread load track 0 (bundled PS4 startup
+    // tune). Music is best-effort: any failure here only disables music,
+    // never the light bars or the menu.
     g_audioInitRc = sceAudioOutInit();
     {
         char buf[128];
         snprintf(buf, sizeof(buf), "sceAudioOutInit rc=%d", (int)g_audioInitRc);
         LogLine(buf);
     }
-    if (g_audioInitRc == 0)
+    // v1.04: make /data/rgb_music/ so custom .pcm files can be FTP'd in
+    // (GoldHEN FTP, see README "Custom music via FTP"). Ignore EEXIST.
     {
-        FILE *af = fopen("/app0/assets/audio/ps4_startup.pcm", "rb");
-        if (af)
-        {
-            fseek(af, 0, SEEK_END);
-            long sz = ftell(af);
-            fseek(af, 0, SEEK_SET);
-            if (sz > 0 && (sz % 2) == 0)
-            {
-                g_pcm = (int16_t *)malloc((size_t)sz);
-                if (g_pcm && fread(g_pcm, 1, (size_t)sz, af) == (size_t)sz)
-                {
-                    g_pcmSamples = (size_t)sz / 2;
-                    char buf[192];
-                    snprintf(buf, sizeof(buf), "PCM loaded: %zu samples = %zu:%02zu @ 48kHz mono (%ld bytes)",
-                             g_pcmSamples, g_pcmSamples / 48000 / 60, (g_pcmSamples / 48000) % 60, sz);
-                    LogLine(buf);
-                }
-                else
-                {
-                    LogLine("WARN: PCM malloc/read failed — music disabled");
-                    if (g_pcm)
-                    {
-                        free(g_pcm);
-                        g_pcm = nullptr;
-                    }
-                }
-            }
-            else
-            {
-                LogLine("WARN: PCM asset has odd/empty size — music disabled");
-            }
-            fclose(af);
-        }
+        int mk = mkdir(FTP_MUSIC_DIR, 0777);
+        char buf[192];
+        if (mk == 0)
+            snprintf(buf, sizeof(buf), "FTP music: created %s/", FTP_MUSIC_DIR);
+        else if (errno == EEXIST)
+            snprintf(buf, sizeof(buf), "FTP music: %s/ already exists", FTP_MUSIC_DIR);
         else
-        {
-            LogLine("WARN: /app0/assets/audio/ps4_startup.pcm missing — music disabled");
-        }
+            snprintf(buf, sizeof(buf), "WARN: mkdir %s/ failed errno=%d — FTP tracks will not be found", FTP_MUSIC_DIR, errno);
+        LogLine(buf);
     }
-    else
-    {
-        LogLine("WARN: sceAudioOutInit failed — music disabled");
-    }
+    ScanFtpTracks(); // bundled tune + any .pcm files in /data/rgb_music/
     g_audioUserId = initialUser;
+    g_trackReq.store(0); // audio thread loads track 0, then opens ports
     g_audioModeReq.store(0); // default: Pad speaker; audio thread opens it
     std::thread audioThread(AudioThreadMain);
     audioThread.detach();
@@ -481,7 +672,8 @@ int main(void)
     int discoSpeed = 3;                 // 1..5, 3 = Normal
     int selectedPad = 0;                // 0..3 = Pad 1..4, 4 = All
     int presetIdx = 0;
-    int menuRow = 0;                    // 0..7 (v1.03: Audio is row 7)
+    int menuRow = 0;                    // 0..8 (v1.04: Track is row 8)
+    int prevMenuRow = -1;               // for rescanning FTP tracks on entering Track row
     OrbisPadColor custom[4];
     for (int i = 0; i < 4; i++)
         custom[i] = kPresets[i % 4];
@@ -539,6 +731,16 @@ int main(void)
             audioMode = (audioMode + dir + 4) % 4;
             g_audioModeReq.store(audioMode); // audio thread applies it
             break;
+        case 8: // Track: cycle bundled tune + FTP .pcm files in /data/rgb_music/
+            if (g_trackCount > 0)
+            {
+                g_trackIdx = (g_trackIdx + dir + g_trackCount) % g_trackCount;
+                g_trackReq.store(g_trackIdx); // audio thread loads it
+                char buf2[160];
+                snprintf(buf2, sizeof(buf2), "Track -> %s (%d/%d)", g_tracks[g_trackIdx].name, g_trackIdx + 1, g_trackCount);
+                LogLine(buf2);
+            }
+            break;
         }
     };
 
@@ -557,6 +759,8 @@ int main(void)
         }
         else if (menuRow == 7)
             adjustRow(1);
+        else if (menuRow == 8)
+            adjustRow(1);
         // R/G/B rows: X does nothing (use Left/Right).
     };
 
@@ -574,11 +778,11 @@ int main(void)
         Color bg = {(uint8_t)(colours[0].r / 10), (uint8_t)(colours[0].g / 10),
                     (uint8_t)(colours[0].b / 10)};
         scene->FrameBufferFill(bg);
-        // 4 colour bars, one per pad (moved down in v1.03: menu has 8 rows now).
+        // 4 colour bars, one per pad (moved down in v1.04: menu has 9 rows now).
         for (int i = 0; i < 4; i++)
         {
             Color bar = {colours[i].r, colours[i].g, colours[i].b};
-            scene->DrawRectangle(120 + i * 440, 925, 400, 55, bar);
+            scene->DrawRectangle(120 + i * 440, 940, 400, 50, bar);
         }
         if (haveFont)
         {
@@ -587,19 +791,19 @@ int main(void)
             Color grey = {180, 180, 180};
             char line[256];
             scene->DrawText((char *)"RGB-CONTROLLER", fontLarge, 120, 180, black, white);
-            scene->DrawText((char *)"v1.03.1 - Menu + RGB Sliders + Disco Speed + Music (audio thread fix)", fontSmall, 120, 280, black, white);
+            scene->DrawText((char *)"v1.04 - Menu + RGB Sliders + Disco Speed + Music + FTP Tracks", fontSmall, 120, 280, black, white);
             snprintf(line, sizeof(line), "MODE: %s   hue %d   Disco speed: %s (%d/5)",
                      kModeNames[mode], hue, kSpeedNames[discoSpeed], discoSpeed);
             scene->DrawText(line, fontSmall, 120, 350, black, white);
-            snprintf(line, sizeof(line), "Pads open: %d / 4    Init rc=%d    User=%d    Audio: %s",
-                     opened, (int)initRc, (int)initialUser, g_audioStatus);
+            snprintf(line, sizeof(line), "Pads open: %d / 4    Init rc=%d    User=%d    Audio: %s    Tracks: %d",
+                     opened, (int)initRc, (int)initialUser, g_audioStatus, g_trackCount);
             scene->DrawText(line, fontSmall, 120, 410, black, white);
 
-            // Menu rows, y = 470 + row*56 (v1.03: 8 rows, tighter spacing).
-            const char *labels[8] = {"Mode", "Pad", "Red", "Green", "Blue", "Preset", "Disco speed", "Audio"};
-            for (int r = 0; r < 8; r++)
+            // Menu rows, y = 470 + row*50 (v1.04: 9 rows, tighter spacing).
+            const char *labels[9] = {"Mode", "Pad", "Red", "Green", "Blue", "Preset", "Disco speed", "Audio", "Track"};
+            for (int r = 0; r < 9; r++)
             {
-                int y = 470 + r * 56;
+                int y = 470 + r * 50;
                 const char *cursor = (r == menuRow) ? ">" : " ";
                 char val[96] = "";
                 Color fg = (r == menuRow) ? white : grey;
@@ -621,6 +825,14 @@ int main(void)
                 case 5: snprintf(val, sizeof(val), "%s", kPresetNames[presetIdx]); break;
                 case 6: snprintf(val, sizeof(val), "%s (%d/5)", kSpeedNames[discoSpeed], discoSpeed); break;
                 case 7: snprintf(val, sizeof(val), "%s", kAudioNames[audioMode]); break;
+                case 8: { // Track: name + position; lock briefly — rescan writes the list
+                    std::lock_guard<std::mutex> lock(g_trackListMutex);
+                    if (g_trackCount > 0 && g_trackIdx < g_trackCount)
+                        snprintf(val, sizeof(val), "%s (%d/%d)", g_tracks[g_trackIdx].name, g_trackIdx + 1, g_trackCount);
+                    else
+                        snprintf(val, sizeof(val), "none");
+                    break;
+                }
                 }
                 snprintf(line, sizeof(line), "%s %s: %s", cursor, labels[r], val);
                 scene->DrawText(line, fontSmall, 120, y, black, fg);
@@ -648,7 +860,7 @@ int main(void)
         frameID++;
     };
 
-    LogLine("v1.03.1 menu running — D-pad to move, Left/Right to adjust, X to confirm");
+    LogLine("v1.04 menu running — D-pad to move, Left/Right to adjust, X to confirm");
     for (;;)
     {
         // ---- Input (Pad 1 only), edge + hold-repeat for Left/Right.
@@ -661,12 +873,12 @@ int main(void)
         uint32_t pressed = buttons & ~prevButtons;
         if (pressed & ORBIS_PAD_BUTTON_UP)
         {
-            menuRow = (menuRow + 7) % 8;
+            menuRow = (menuRow + 8) % 9;
             heldButton = 0; heldTicks = 0;
         }
         if (pressed & ORBIS_PAD_BUTTON_DOWN)
         {
-            menuRow = (menuRow + 1) % 8;
+            menuRow = (menuRow + 1) % 9;
             heldButton = 0; heldTicks = 0;
         }
         if (pressed & ORBIS_PAD_BUTTON_CROSS)
@@ -701,6 +913,20 @@ int main(void)
             heldButton = 0; heldTicks = 0;
         }
         prevButtons = buttons;
+
+        // v1.04: rescanning FTP tracks when the Track row is first entered,
+        // so files FTP'd in since startup show up without restarting the app.
+        // Skipped if a track switch is still pending.
+        if (menuRow == 8 && prevMenuRow != 8 && g_trackReq.load() < 0)
+        {
+            ScanFtpTracks();
+            if (g_trackIdx >= g_trackCount)
+            {
+                g_trackIdx = 0;
+                g_trackReq.store(0);
+            }
+        }
+        prevMenuRow = menuRow;
 
         // ---- Colours for this tick.
         OrbisPadColor colours[4];

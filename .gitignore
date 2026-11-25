@@ -1,0 +1,19 @@
+# Build outputs — never commit these
+*.pkg
+*.oelf
+*.elf
+*.o
+eboot.bin
+pkg.gp4
+sce_sys/param.sfo
+
+# Intermediate build directory
+RGBBarControl/x64/
+
+# VS Code local settings
+.vscode/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*~
